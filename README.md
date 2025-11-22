@@ -1,9 +1,9 @@
 # NetLogAnalyzer
 
 # contributors 
-    Before getting to work on the project please check the docs folder and the project-temp.md espetially to understand the structure of the project. 
+    Before getting to work on the project please check the docs folder and the project-temp.md especially to understand the structure of the project. 
 
-# Contibutors (active):
+# Contributors (active):
     @ChaosDragon01
     @Julznyc12
 
