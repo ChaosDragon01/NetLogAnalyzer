@@ -16,7 +16,7 @@ log-analyzer/
 │   │
 │   ├── storage/
 │   │   ├── __init__.py
-│   │   ├── database.py        # MongoDB/SQL handling
+│   │   ├── database.py        # MongoDB/SQL handling   
 │   │   └── models.py          # Data models (logs, alerts)
 │   │
 │   ├── api/
