@@ -1,4 +1,6 @@
 
+class Base:
+    pass
 
 
 class User:
