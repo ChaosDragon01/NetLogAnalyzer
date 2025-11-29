@@ -2,6 +2,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from .models import Base
 
+
+
+
 log = None  # Placeholder for the log model
 filter = None  # Placeholder for filter criteria
 alert = None  # Placeholder for the alert model
