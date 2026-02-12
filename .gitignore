@@ -1,100 +1,26 @@
-# -----------------------------
-# Python
-# -----------------------------
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg-info/
-*.egg
-*.log
-
-# Virtual environments
-venv/
-env/
-.venv/
-ENV/
-env.bak/
-
-# Distribution / packaging
-build/
+# --- Node.js (Dashboard) ---
+node_modules/
 dist/
-*.egg-info/
+build/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env
 
-# -----------------------------
-# Logs & runtime files
-# -----------------------------
-logs/
-*.log
-*.tmp
-*.pid
-*.cache
-*.db
-*.sqlite3
+# --- Rust (Engine) ---
+/target/
+**/*.rs.bk
+debug/
+release/
 
-# -----------------------------
-# Configs (local-only)
-# -----------------------------
-config/*.local.yaml
-config/*.secret.yaml
-config/*.private.yaml
-
-# Do NOT ignore base settings.yaml or pipeline configs
-# They’re safe to commit since they define structure, not secrets.
-
-# -----------------------------
-# Test Artifacts
-# -----------------------------
-tests/sample_logs/*.log
-tests/sample_logs/*.json
-tests/sample_logs/*.xml
-
-coverage/
-.coverage
-htmlcov/
-
-# -----------------------------
-# IDE / Editor Files
-# -----------------------------
+# --- IDEs & OS ---
 .vscode/
 .idea/
 *.swp
-*.swo
-*.DS_Store
-
-# -----------------------------
-# Docker & container artifacts
-# -----------------------------
-*.tar
-docker-data/
-docker-compose.override.yml
-
-# -----------------------------
-# Python tooling
-# -----------------------------
-.mypy_cache/
-.pytest_cache/
-.pylint.d/
-.dmypy.json
-
-# -----------------------------
-# OS-generated files
-# -----------------------------
+.DS_Store
 Thumbs.db
-Desktop.ini
 
-# -----------------------------
-# Security-sensitive
-# -----------------------------
-*.key
-*.crt
-*.pem
-*.env
-.env.*
-
-
-
-#github 
-.github/
-# -----------------------------
+# --- Logs ---
+logs/
+*.log
+!logs/.keep  # (Optional: keeps the logs folder structure but ignores files inside)
