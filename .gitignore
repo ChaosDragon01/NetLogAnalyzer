@@ -24,3 +24,7 @@ Thumbs.db
 logs/
 *.log
 !logs/.keep  # (Optional: keeps the logs folder structure but ignores files inside)
+
+init.sh
+
+
