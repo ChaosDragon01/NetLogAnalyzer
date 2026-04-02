@@ -1,12 +1,8 @@
 //! NetLogAnalyzer — AI-powered Network Log Analyzer / Intrusion Detection System
 //!
 //! Architecture:
-//!   Rust core (this binary) captures and parses packets, runs detection modules,
-//!   then emits one JSON object per line to stdout so a downstream consumer
-//!   (e.g. a Node.js/TypeScript dashboard) can ingest the stream via a Unix pipe.
-//!
-//! Usage:
-//!   sudo net-log-analyzer --interface eth0 [--scan-threshold 20] [--window-secs 10]
+//!   Rust backend captures and parses packets, runs detection modules,
+//!   and broadcasts packet + alert events to WebSocket clients in real time.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,18 +11,28 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
 use chrono::Utc;
 use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
 use pcap::{Capture, Device};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(
     name = "net-log-analyzer",
-    about = "High-performance network packet analyzer with intrusion detection"
+    about = "Network packet analyzer with intrusion detection and WebSocket streaming"
 )]
 struct Cli {
     /// Network interface to sniff (e.g. eth0, en0). Omit to use the default device.
@@ -41,14 +47,20 @@ struct Cli {
     /// Rolling time window (seconds) used by the port scan detector.
     #[arg(long, default_value_t = 10)]
     window_secs: u64,
+
+    /// Host interface for the Axum server.
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+
+    /// Port for the Axum server.
+    #[arg(long, default_value_t = 3000)]
+    port: u16,
 }
 
 // ─── Data model ───────────────────────────────────────────────────────────────
 
-/// Every captured packet is serialised into this struct and emitted as one JSON line.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PacketData {
-    /// RFC-3339 timestamp of capture.
     pub timestamp: String,
     pub src_ip: Option<String>,
     pub dst_ip: Option<String>,
@@ -62,14 +74,14 @@ pub struct PacketData {
     pub alert: Option<Alert>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Alert {
     pub module: String,
     pub severity: Severity,
     pub message: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Severity {
     Low,
@@ -78,27 +90,24 @@ pub enum Severity {
     Critical,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum WsEvent {
+    Packet(PacketData),
+    Alert(Alert),
+}
+
 // ─── Detection engine trait ────────────────────────────────────────────────────
 
-/// Every anomaly-detection module implements this trait.
-/// Additional modules (DDoS detector, zero-day heuristics, ML scorer, …) can be
-/// plugged in without touching the capture loop.
 pub trait DetectionEngine: Send + Sync {
-    /// Inspect a parsed packet and optionally return an alert.
     fn inspect(&mut self, packet: &PacketData) -> Option<Alert>;
 }
 
 // ─── Port-scan detector ────────────────────────────────────────────────────────
 
-/// Tracks the unique destination ports contacted by each source IP within a
-/// rolling time window.  When the count exceeds `threshold` the source IP is
-/// flagged as performing a port scan.
 pub struct PortScanModule {
-    /// source IP → (window start, set of distinct dst ports seen, alert already raised)
     state: HashMap<String, (Instant, HashSet<u16>, bool)>,
-    /// Ports-per-window threshold before an alert is raised.
     threshold: usize,
-    /// Length of the rolling window.
     window: Duration,
 }
 
@@ -114,7 +123,6 @@ impl PortScanModule {
 
 impl DetectionEngine for PortScanModule {
     fn inspect(&mut self, packet: &PacketData) -> Option<Alert> {
-        // Only track packets that have both a source IP and a destination port.
         let src = packet.src_ip.as_deref()?;
         let dst_port = packet.dst_port?;
 
@@ -124,16 +132,14 @@ impl DetectionEngine for PortScanModule {
             .entry(src.to_owned())
             .or_insert_with(|| (now, HashSet::new(), false));
 
-        // Reset the window if it has expired.
         if now.duration_since(entry.0) > self.window {
             *entry = (now, HashSet::new(), false);
         }
 
         entry.1.insert(dst_port);
 
-        // Only emit one alert per source IP per window to avoid alert storms.
         if entry.1.len() >= self.threshold && !entry.2 {
-            entry.2 = true; // mark as alerted for this window
+            entry.2 = true;
             Some(Alert {
                 module: "PortScanDetector".to_owned(),
                 severity: Severity::High,
@@ -151,10 +157,7 @@ impl DetectionEngine for PortScanModule {
 
 // ─── Packet parser ─────────────────────────────────────────────────────────────
 
-/// Parse a raw pcap packet buffer into a `PacketData`.
-/// Supports Ethernet frames carrying IPv4/IPv6 with TCP, UDP, or ICMP.
 fn parse_packet(raw: &[u8]) -> Option<PacketData> {
-    // Minimum Ethernet header: 14 bytes.
     if raw.len() < 14 {
         return None;
     }
@@ -162,16 +165,13 @@ fn parse_packet(raw: &[u8]) -> Option<PacketData> {
     let ether_type = u16::from_be_bytes([raw[12], raw[13]]);
 
     match ether_type {
-        // IPv4
         0x0800 => parse_ipv4(&raw[14..]),
-        // IPv6
         0x86DD => parse_ipv6(&raw[14..]),
         _ => None,
     }
 }
 
 fn parse_ipv4(ip: &[u8]) -> Option<PacketData> {
-    // Minimum IPv4 header: 20 bytes.
     if ip.len() < 20 {
         return None;
     }
@@ -190,7 +190,6 @@ fn parse_ipv4(ip: &[u8]) -> Option<PacketData> {
 }
 
 fn parse_ipv6(ip: &[u8]) -> Option<PacketData> {
-    // Minimum IPv6 header: 40 bytes.
     if ip.len() < 40 {
         return None;
     }
@@ -217,19 +216,16 @@ fn extract_transport(
     payload_size: u16,
 ) -> Option<PacketData> {
     let (protocol, src_port, dst_port) = match protocol_byte {
-        // TCP
         6 if payload.len() >= 4 => {
             let sp = u16::from_be_bytes([payload[0], payload[1]]);
             let dp = u16::from_be_bytes([payload[2], payload[3]]);
             ("TCP".to_owned(), Some(sp), Some(dp))
         }
-        // UDP
         17 if payload.len() >= 4 => {
             let sp = u16::from_be_bytes([payload[0], payload[1]]);
             let dp = u16::from_be_bytes([payload[2], payload[3]]);
             ("UDP".to_owned(), Some(sp), Some(dp))
         }
-        // ICMP / ICMPv6
         1 | 58 => ("ICMP".to_owned(), None, None),
         _ => ("OTHER".to_owned(), None, None),
     };
@@ -248,11 +244,9 @@ fn extract_transport(
 
 // ─── Capture loop ─────────────────────────────────────────────────────────────
 
-/// Runs in a dedicated blocking thread (pcap is synchronous) and sends parsed
-/// packets over a tokio channel to the async analysis task.
 fn capture_thread(
     device_name: String,
-    tx: tokio::sync::mpsc::Sender<PacketData>,
+    tx: mpsc::Sender<PacketData>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut cap = Capture::from_device(device_name.as_str())
         .map_err(|e| format!("Failed to open device '{device_name}': {e}"))?
@@ -263,8 +257,7 @@ fn capture_thread(
         .map_err(|e| {
             if e.to_string().to_lowercase().contains("permission") {
                 format!(
-                    "Permission denied opening '{device_name}'. \
-                     Try running with sudo or granting CAP_NET_RAW."
+                    "Permission denied opening '{device_name}'. Try running with sudo or granting CAP_NET_RAW."
                 )
             } else {
                 format!("Failed to activate capture on '{device_name}': {e}")
@@ -275,7 +268,6 @@ fn capture_thread(
         match cap.next_packet() {
             Ok(packet) => {
                 if let Some(parsed) = parse_packet(packet.data) {
-                    // If the async receiver has been dropped, exit cleanly.
                     if tx.blocking_send(parsed).is_err() {
                         break;
                     }
@@ -292,13 +284,60 @@ fn capture_thread(
     Ok(())
 }
 
-// ─── Entry point ──────────────────────────────────────────────────────────────
+#[derive(Clone)]
+struct AppState {
+    ws_tx: broadcast::Sender<String>,
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state.ws_tx.subscribe()))
+}
+
+async fn handle_socket(socket: WebSocket, mut rx: broadcast::Receiver<String>) {
+    let (mut sender, mut receiver) = socket.split();
+
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                Message::Close(_) => break,
+                Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Binary(_) => {}
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(payload) => {
+                        if sender.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = &mut tokio::pin!(recv_task) => {
+                break;
+            }
+        }
+    }
+}
+
+fn send_ws_event(tx: &broadcast::Sender<String>, event: &WsEvent) {
+    match serde_json::to_string(event) {
+        Ok(payload) => {
+            let _ = tx.send(payload);
+        }
+        Err(e) => eprintln!("WebSocket serialisation error: {e}"),
+    }
+}
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    // Resolve device name.
     let device_name = match cli.interface {
         Some(ref iface) => iface.clone(),
         None => match Device::lookup() {
@@ -320,37 +359,55 @@ async fn main() {
         cli.scan_threshold, cli.window_secs
     );
 
-    // Build the detection pipeline.
-    // Arc<Mutex<…>> lets us share the engine across the async boundary.
     let engine: Arc<Mutex<Box<dyn DetectionEngine>>> = Arc::new(Mutex::new(Box::new(
         PortScanModule::new(cli.scan_threshold, cli.window_secs),
     )));
 
-    // Channel bridging the blocking capture thread and the async analysis task.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<PacketData>(4096);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<PacketData>(4096);
+    let (ws_tx, _) = broadcast::channel::<String>(4096);
 
-    // Spawn the blocking pcap loop in a dedicated OS thread so it never starves
-    // the tokio executor.
     let spawn_device = device_name.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = capture_thread(spawn_device, tx) {
+    let capture_task = tokio::task::spawn_blocking(move || {
+        if let Err(e) = capture_thread(spawn_device, packet_tx) {
             eprintln!("Fatal capture error: {e}");
-            std::process::exit(1);
         }
     });
 
-    // Async analysis + output loop.
-    while let Some(mut packet) = rx.recv().await {
-        // Run every detection module.
-        {
-            let mut eng = engine.lock().await;
-            packet.alert = eng.inspect(&packet);
-        }
+    let ws_event_tx = ws_tx.clone();
+    let engine_ref = engine.clone();
+    tokio::spawn(async move {
+        while let Some(mut packet) = packet_rx.recv().await {
+            {
+                let mut eng = engine_ref.lock().await;
+                packet.alert = eng.inspect(&packet);
+            }
 
-        // Serialise to a single JSON line and flush to stdout.
-        match serde_json::to_string(&packet) {
-            Ok(json) => println!("{json}"),
-            Err(e) => eprintln!("Serialisation error: {e}"),
+            send_ws_event(&ws_event_tx, &WsEvent::Packet(packet.clone()));
+            if let Some(alert) = packet.alert {
+                send_ws_event(&ws_event_tx, &WsEvent::Alert(alert));
+            }
         }
+    });
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/ws", get(ws_handler))
+        .with_state(AppState { ws_tx: ws_tx.clone() });
+
+    let bind_addr = format!("{}:{}", cli.host, cli.port);
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("Failed to bind Axum server on {bind_addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("WebSocket server listening on ws://{bind_addr}/ws");
+
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("Server error: {e}");
     }
+
+    let _ = capture_task.await;
 }
