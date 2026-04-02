@@ -13,7 +13,7 @@ use std::{
 
 use axum::{
     extract::{
-        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
     response::IntoResponse,
@@ -308,11 +308,7 @@ async fn handle_socket(socket: WebSocket, mut rx: broadcast::Receiver<String>) {
     while !recv_task.is_finished() {
         match rx.recv().await {
             Ok(payload) => {
-                if sender
-                    .send(Message::Text(Utf8Bytes::from(payload)))
-                    .await
-                    .is_err()
-                {
+                if sender.send(Message::Text(payload.into())).await.is_err() {
                     break;
                 }
             }
