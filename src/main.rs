@@ -13,7 +13,7 @@ use std::{
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
         State,
     },
     response::IntoResponse,
@@ -305,24 +305,23 @@ async fn handle_socket(socket: WebSocket, mut rx: broadcast::Receiver<String>) {
         }
     });
 
-    loop {
-        tokio::select! {
-            result = rx.recv() => {
-                match result {
-                    Ok(payload) => {
-                        if sender.send(Message::Text(payload.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
+    while !recv_task.is_finished() {
+        match rx.recv().await {
+            Ok(payload) => {
+                if sender
+                    .send(Message::Text(Utf8Bytes::from(payload)))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
-            _ = &mut tokio::pin!(recv_task) => {
-                break;
-            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+
+    recv_task.abort();
 }
 
 fn send_ws_event(tx: &broadcast::Sender<String>, event: &WsEvent) {
