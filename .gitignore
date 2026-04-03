@@ -98,3 +98,10 @@ Desktop.ini
 #github 
 .github/
 # -----------------------------
+
+# Rust build artifacts
+target/
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/dist/
