@@ -328,7 +328,7 @@ fn send_ws_event(tx: &broadcast::Sender<String>, event: &WsEvent) {
         Err(e) => eprintln!("WebSocket serialisation error: {e}"),
     }
 }
-
+/*
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -405,4 +405,85 @@ async fn main() {
     }
 
     let _ = capture_task.await;
+}
+*/
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+
+    // 1. Get a list of target devices
+    let target_devices: Vec<String> = match cli.interface {
+        Some(ref iface) => vec![iface.clone()],
+        None => {
+            eprintln!("No specific interface provided. Finding all available devices...");
+            match Device::list() {
+                Ok(devices) => devices.into_iter().map(|d| d.name).collect(),
+                Err(e) => {
+                    eprintln!("Failed to list devices: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    eprintln!(
+        "Port scan threshold: {} ports / {}s window",
+        cli.scan_threshold, cli.window_secs
+    );
+
+    let engine: Arc<Mutex<Box<dyn DetectionEngine>>> = Arc::new(Mutex::new(Box::new(
+        PortScanModule::new(cli.scan_threshold, cli.window_secs),
+    )));
+
+    // 2. The mpsc channel handles multiple senders automatically
+    let (packet_tx, mut packet_rx) = mpsc::channel::<PacketData>(4096);
+    let (ws_tx, _) = broadcast::channel::<String>(4096);
+
+    // 3. Spawn a capture thread for every device we found
+    for device_name in target_devices {
+        let tx_clone = packet_tx.clone();
+        let name_clone = device_name.clone();
+        
+        tokio::task::spawn_blocking(move || {
+            // We ignore errors here because Windows has many hidden or offline 
+            // adapters that will naturally fail to open.
+            let _ = capture_thread(name_clone, tx_clone);
+        });
+    }
+
+    let ws_event_tx = ws_tx.clone();
+    let engine_ref = engine.clone();
+    tokio::spawn(async move {
+        while let Some(mut packet) = packet_rx.recv().await {
+            {
+                let mut eng = engine_ref.lock().await;
+                packet.alert = eng.inspect(&packet);
+            }
+
+            send_ws_event(&ws_event_tx, &WsEvent::Packet(packet.clone()));
+            if let Some(alert) = packet.alert {
+                send_ws_event(&ws_event_tx, &WsEvent::Alert(alert));
+            }
+        }
+    });
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/ws", get(ws_handler))
+        .with_state(AppState { ws_tx: ws_tx.clone() });
+
+    let bind_addr = format!("{}:{}", cli.host, cli.port);
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("Failed to bind Axum server on {}: {}", bind_addr, e);
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("WebSocket server listening on ws://{}/ws", bind_addr);
+
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("Server error: {}", e);
+    }
 }
